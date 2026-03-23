@@ -15,3 +15,12 @@ Native Command Execution: Must separate visual messages from functional commands
 State-Awareness: Must evaluate environmental conditions (Time of day, Blood Moon, Raining) before executing a broadcast payload.
 
 Dynamic Variable Parsing: Must replace tags like {player}, {world}, and {context} dynamically based on the event source (e.g., mapping TShock's death reasons to {context}).
+
+Technical Specifications
+Dependencies: System.Text.Json, native HttpClient for Webhooks.
+
+TShock Hooks: ServerChat, NpcKilled, NetGetData (Packet 118 - Player Death V2), GameUpdate (60-tick pulse for time-of-day transitions).
+
+Commands: None natively. It relies entirely on chat parsing.
+
+Data Structure: Requires mapping standard JSON arrays into strongly typed Broadcast C# objects.
