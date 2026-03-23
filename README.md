@@ -1,26 +1,75 @@
-# TShock_Herald
-Module: The Herald (Event &amp; Communication Engine) Objective: Act as the server's automated Town Crier. It monitors in-game triggers (chat, time, boss kills, deaths) and dispatches formatted broadcasts to the server and webhooks to Discord.
+# The Herald
+### Event & Communication Engine for TShock
 
+The Herald is a specialized TShock plugin designed to handle automated server announcements, event-based messaging, and Discord integrations. By isolating communication logic into a standalone module, it reduces CPU overhead and ensures that gameplay events—like boss kills or player deaths—are met with dynamic, configurable responses.
 
-Module: The Herald (Event & Communication Engine)
-Objective: Act as the server's automated Town Crier. It monitors in-game triggers (chat, time, boss kills, deaths) and dispatches formatted broadcasts to the server and webhooks to Discord.
+---
 
-Core Requirements
-JSON Hot-Reloading: Must monitor the /Broadcasts folder and seamlessly update trigger conditions in memory without requiring a server restart.
+## Features
 
-Chat Interception: Must parse user chat for specific triggers (e.g., !lfg, !bright) and hide the trigger text from public chat if configured.
+* **JSON Hot-Reloading**: Update your broadcast rules in real-time. The Herald monitors your configuration files and reloads them instantly without requiring a server restart.
+* **Command Execution**: Separate visual messages from functional actions. Execute native TShock commands (e.g., `/time dawn`) silently as the Server while displaying custom text to players.
+* **Dynamic Variable Parsing**: Support for `{player}`, `{world}`, `{context}`, and other tags to create immersive, automated responses.
+* **Environmental Filtering**: Set broadcasts to trigger only during specific conditions, such as Blood Moons, rainy weather, or when "Streamer Mode" is active.
+* **Performance Optimized**: Automatically "sleeps" and skips update logic when the server is empty to conserve resources.
 
-Native Command Execution: Must separate visual messages from functional commands, executing commands as the Server to bypass user permission checks.
+---
 
-State-Awareness: Must evaluate environmental conditions (Time of day, Blood Moon, Raining) before executing a broadcast payload.
+## Installation
 
-Dynamic Variable Parsing: Must replace tags like {player}, {world}, and {context} dynamically based on the event source (e.g., mapping TShock's death reasons to {context}).
+1. Download the `Herald.dll` from the repository releases.
+2. Place the `.dll` into your TShock `ServerPlugins` folder.
+3. Restart your server to generate the directory structure at `tshock/Herald/`.
+4. Place your broadcast JSON files (e.g., `Admin.json`, `LFG.json`) into the `tshock/Herald/Broadcasts/` folder.
 
-Technical Specifications
-Dependencies: System.Text.Json, native HttpClient for Webhooks.
+---
 
-TShock Hooks: ServerChat, NpcKilled, NetGetData (Packet 118 - Player Death V2), GameUpdate (60-tick pulse for time-of-day transitions).
+## Configuration
 
-Commands: None natively. It relies entirely on chat parsing.
+### HeraldConfig.json
+This file manages global settings and streamer integration.
 
-Data Structure: Requires mapping standard JSON arrays into strongly typed Broadcast C# objects.
+| Property | Description |
+| :--- | :--- |
+| `enableBroadcaster` | Master toggle for all broadcast logic. |
+| `globalDiscordWebhookUrl` | Default webhook for all Discord announcements. |
+| `streamerName` | The name used for the `{streamer}` variable. |
+| `streamUrl` | The URL used for the `{streamUrl}` variable. |
+| `isStreaming` | Boolean toggle for the `streaming` condition. |
+
+### Broadcast JSONs
+Each file in the `Broadcasts/` folder contains an array of broadcast objects.
+
+| Field | Description |
+| :--- | :--- |
+| `name` | Unique identifier for the broadcast. |
+| `triggerTypes` | Types: `Chat`, `Death`, `TimeTransition`, `NPCKill`, `Timed`. |
+| `triggerWords` | Keywords that fire the event (e.g., `!lfg`, `lava`). |
+| `commands` | List of TShock commands to execute as the Server. |
+| `messages` | List of messages; one is chosen at random per trigger. |
+| `conditions` | Logic checks: `bloodmoon`, `raining`, `day`, `night`, `streaming`. |
+
+---
+
+## Dynamic Variables
+
+The following tags can be used in both `messages` and `commands`:
+
+* **`{player}`**: Name of the player triggering the event.
+* **`{world}`**: Current name of the world.
+* **`{context}`**: Contextual data, such as a formatted death reason.
+* **`{online}`**: Total number of active players.
+* **`{streamer}`**: Streamer name from the global config.
+* **`{streamUrl}`**: Twitch/Stream link from the global config.
+
+---
+
+## Commands
+
+* **`/herald reload`**: Manually reloads all configurations and broadcast files.
+* **`/herald live`**: Toggles "Streamer Mode" status in the config.
+
+---
+
+## License
+MIT
