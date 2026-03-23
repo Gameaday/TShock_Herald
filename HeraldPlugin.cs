@@ -19,7 +19,7 @@ namespace Herald;
 public class HeraldPlugin : TerrariaPlugin
 {
     public override string Name => "The Herald";
-    public override Version Version => new Version(1, 0, 0);
+    public override Version Version => new Version(1, 1, 0);
     public override string Author => "HistoryLabs";
 
     private string BasePath => Path.Combine(TShock.SavePath, "Herald");
@@ -133,7 +133,6 @@ public class HeraldPlugin : TerrariaPlugin
         if (++_tickCounter < 60) return;
         _tickCounter = 0;
 
-        // Sleep if server is empty
         if (!_config.EnableBroadcaster || !TShock.Players.Any(p => p != null && p.Active)) return;
 
         if (Main.dayTime != _wasDayTime)
@@ -167,12 +166,16 @@ public class HeraldPlugin : TerrariaPlugin
     {
         if (!_config.EnableBroadcaster) return;
         var npc = args.npc;
+        
         foreach (var bc in _allBroadcasts.Where(b => b.Enabled && b.TriggerTypes.Contains("NPCKill")))
         {
-            if (bc.TriggerNPCs.Count > 0 && !bc.TriggerNPCs.Any(n => n.Equals(npc.FullName, StringComparison.OrdinalIgnoreCase)))
-                continue;
+            // 1. Check Exact Name (Legacy support for specific targets like "King Slime")
+            bool nameMatch = bc.TriggerNPCs.Count == 0 || bc.TriggerNPCs.Any(n => n.Equals(npc.FullName, StringComparison.OrdinalIgnoreCase));
+            
+            // 2. The Semantic Trait Check
+            bool tagMatch = CheckSemanticTags(bc, npc);
 
-            if (CheckConditions(bc)) ExecuteBroadcast(bc, null);
+            if (nameMatch && tagMatch && CheckConditions(bc)) ExecuteBroadcast(bc, null, npc.FullName);
         }
     }
 
@@ -200,6 +203,27 @@ public class HeraldPlugin : TerrariaPlugin
     }
 
     // --- EVALUATION & EXECUTION ---
+    
+    // NEW: On-the-fly Semantic Evaluator
+    private bool CheckSemanticTags(Broadcast bc, NPC npc)
+    {
+        if (bc.TriggerTags.Count == 0) return true;
+
+        foreach(var tag in bc.TriggerTags.Select(t => t.ToLower()))
+        {
+            if (tag == "boss" && !npc.boss) return false;
+            if (tag == "flying" && !npc.noGravity) return false;
+            if (tag == "aquatic" && npc.waterMovementSpeed <= 0) return false;
+            if (tag == "slime" && npc.aiStyle != 1 && npc.aiStyle != 15) return false;
+            if (tag == "townnpc" && !npc.townNPC) return false;
+            if (tag == "enemy" && (npc.friendly || npc.townNPC)) return false;
+            
+            // Proxies for difficulty if admins want to target elite enemies
+            if (tag == "elite" && npc.value < 1000) return false; 
+        }
+        return true; 
+    }
+
     private void ProcessBroadcasts(string trigger, string type, TSPlayer? target)
     {
         foreach (var bc in _allBroadcasts.Where(b => b.Enabled && b.TriggerTypes.Contains(type)))
@@ -244,7 +268,6 @@ public class HeraldPlugin : TerrariaPlugin
 
     private void ExecuteBroadcast(Broadcast bc, TSPlayer? target, string? specialContext = null)
     {
-        // Execute Commands natively
         foreach (var cmd in bc.Commands)
         {
             string formattedCmd = cmd.Replace("{player}", target?.Name ?? "Server")
@@ -258,7 +281,7 @@ public class HeraldPlugin : TerrariaPlugin
             string msg = bc.Messages[Random.Shared.Next(bc.Messages.Count)]
                 .Replace("{player}", target?.Name ?? "Server")
                 .Replace("{world}", Main.worldName)
-                .Replace("{context}", specialContext ?? "")
+                .Replace("{context}", specialContext ?? "") // Helpful: will output the dead mob's name or death reason
                 .Replace("{streamer}", _config.StreamerName)
                 .Replace("{streamUrl}", _config.StreamUrl)
                 .Replace("{online}", TShock.Players.Count(p => p != null && p.Active).ToString());
