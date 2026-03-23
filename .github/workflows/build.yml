@@ -1,0 +1,36 @@
+name: Build and Release Herald
+
+# 1. THE TRIGGER: Runs only when you publish a new Release (or manually)
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# 2. THE PERMISSIONS: Required so the bot is allowed to upload files to your release
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup .NET 9
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '9.0.x'
+
+    - name: Build The Herald
+      run: dotnet publish Herald.csproj -c Release -o ./out
+
+    # 3. THE UPLOADER: Attaches the .dll directly to the GitHub Release page
+    - name: Upload to GitHub Release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ./out/Herald.dll
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
