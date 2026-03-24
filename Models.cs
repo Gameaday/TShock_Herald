@@ -26,7 +26,6 @@ public class Broadcast
     public List<string> TriggerWords { get; set; } = new();
     public List<string> TriggerNPCs { get; set; } = new();
     
-    // NEW: The Semantic Tag Array
     public List<string> TriggerTags { get; set; } = new(); 
     
     public List<string> TriggerRegions { get; set; } = new();
@@ -54,8 +53,3 @@ public class Broadcast
         }
     }
 }
-
-[JsonSourceGenerationOptions(WriteIndented = true, PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
-[JsonSerializable(typeof(HeraldConfig))]
-[JsonSerializable(typeof(List<Broadcast>))]
-internal partial class HeraldJsonContext : JsonSerializerContext { }
