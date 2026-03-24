@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -27,12 +28,19 @@ public class HeraldPlugin : TerrariaPlugin
     private string ConfigPath => Path.Combine(BasePath, "HeraldConfig.json");
 
     private HeraldConfig _config = new();
-    private List<Broadcast> _allBroadcasts = new();
     private FileSystemWatcher? _configWatcher;
     private DateTime _lastConfigReload = DateTime.UtcNow;
     private bool _wasDayTime;
     private int _tickCounter = 0;
+    
     private static readonly HttpClient _httpClient = new();
+    private readonly ConcurrentDictionary<string, DateTime> _webhookDebouncer = new(); // NEW: Prevents Discord rate limits
+
+    // NEW: Pre-cached lists for zero-LINQ allocations in high-frequency hooks
+    private List<Broadcast> _chatBroadcasts = new();
+    private List<Broadcast> _npcBroadcasts = new();
+    private List<Broadcast> _deathBroadcasts = new();
+    private List<Broadcast> _timeBroadcasts = new();
 
     public HeraldPlugin(Main game) : base(game) { }
 
@@ -68,7 +76,6 @@ public class HeraldPlugin : TerrariaPlugin
         base.Dispose(disposing);
     }
 
-    // --- HOT RELOAD & CONFIG ---
     private void StartHotReloader()
     {
         try
@@ -98,17 +105,26 @@ public class HeraldPlugin : TerrariaPlugin
         {
             if (File.Exists(ConfigPath))
             {
-                var tempConfig = JsonSerializer.Deserialize(File.ReadAllText(ConfigPath), HeraldJsonContext.Default.HeraldConfig);
-                if (tempConfig != null) _config = tempConfig;
+                var text = File.ReadAllText(ConfigPath);
+                _config = JsonSerializer.Deserialize<HeraldConfig>(text, new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new HeraldConfig();
             }
-            else File.WriteAllText(ConfigPath, JsonSerializer.Serialize(_config, HeraldJsonContext.Default.HeraldConfig));
+            else
+            {
+                var options = new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+                File.WriteAllText(ConfigPath, JsonSerializer.Serialize(_config, options));
+            }
         }
         catch (Exception ex) { TShock.Log.ConsoleError($"[Herald] Config Error: {ex.Message}"); }
     }
 
     private void LoadBroadcasts()
     {
-        var safeTempList = new List<Broadcast>();
+        var tempChat = new List<Broadcast>();
+        var tempNpc = new List<Broadcast>();
+        var tempDeath = new List<Broadcast>();
+        var tempTime = new List<Broadcast>();
+        int total = 0;
+
         try
         {
             var files = Directory.GetFiles(BroadcastsPath, "*.json");
@@ -116,18 +132,35 @@ public class HeraldPlugin : TerrariaPlugin
             {
                 try
                 {
-                    var list = JsonSerializer.Deserialize(File.ReadAllText(file), HeraldJsonContext.Default.ListBroadcast);
-                    if (list != null) safeTempList.AddRange(list);
+                    var text = File.ReadAllText(file);
+                    var list = JsonSerializer.Deserialize<List<Broadcast>>(text, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    
+                    if (list != null)
+                    {
+                        foreach (var bc in list.Where(b => b.Enabled))
+                        {
+                            if (bc.TriggerTypes.Contains("Chat", StringComparer.OrdinalIgnoreCase)) tempChat.Add(bc);
+                            if (bc.TriggerTypes.Contains("NPCKill", StringComparer.OrdinalIgnoreCase)) tempNpc.Add(bc);
+                            if (bc.TriggerTypes.Contains("Death", StringComparer.OrdinalIgnoreCase)) tempDeath.Add(bc);
+                            if (bc.TriggerTypes.Contains("TimeTransition", StringComparer.OrdinalIgnoreCase)) tempTime.Add(bc);
+                            total++;
+                        }
+                    }
                 }
                 catch (Exception ex) { TShock.Log.ConsoleError($"[Herald] Failed to load {Path.GetFileName(file)}: {ex.Message}"); }
             }
-            _allBroadcasts = safeTempList;
-            TShock.Log.ConsoleInfo($"[Herald] Indexed {_allBroadcasts.Count} broadcast triggers.");
+            
+            // Swap references atomically
+            _chatBroadcasts = tempChat;
+            _npcBroadcasts = tempNpc;
+            _deathBroadcasts = tempDeath;
+            _timeBroadcasts = tempTime;
+            
+            TShock.Log.ConsoleInfo($"[Herald] Indexed {total} active broadcast triggers.");
         }
         catch (Exception ex) { TShock.Log.ConsoleError($"[Herald] Broadcast Library Error: {ex.Message}"); }
     }
 
-    // --- EVENT HOOKS ---
     private void OnUpdate(EventArgs args)
     {
         if (++_tickCounter < 60) return;
@@ -138,7 +171,15 @@ public class HeraldPlugin : TerrariaPlugin
         if (Main.dayTime != _wasDayTime)
         {
             _wasDayTime = Main.dayTime;
-            ProcessBroadcasts(Main.dayTime ? "Dawn" : "Dusk", "TimeTransition", null);
+            string trigger = Main.dayTime ? "Dawn" : "Dusk";
+            
+            foreach (var bc in _timeBroadcasts)
+            {
+                if ((bc.TriggerWords.Count == 0 || bc.TriggerWords.Contains(trigger, StringComparer.OrdinalIgnoreCase)) && CheckConditions(bc))
+                {
+                    ExecuteBroadcast(bc, null);
+                }
+            }
         }
     }
 
@@ -149,7 +190,8 @@ public class HeraldPlugin : TerrariaPlugin
         var player = TShock.Players[args.Who];
         if (player == null) return;
 
-        foreach (var bc in _allBroadcasts.Where(b => b.Enabled && b.TriggerTypes.Contains("Chat")))
+        // ZERO LINQ OVERHEAD
+        foreach (var bc in _chatBroadcasts)
         {
             if (bc.TriggerWords.Any(tw => text.Contains(tw.ToLower())))
             {
@@ -167,12 +209,10 @@ public class HeraldPlugin : TerrariaPlugin
         if (!_config.EnableBroadcaster) return;
         var npc = args.npc;
         
-        foreach (var bc in _allBroadcasts.Where(b => b.Enabled && b.TriggerTypes.Contains("NPCKill")))
+        // ZERO LINQ OVERHEAD
+        foreach (var bc in _npcBroadcasts)
         {
-            // 1. Check Exact Name (Legacy support for specific targets like "King Slime")
             bool nameMatch = bc.TriggerNPCs.Count == 0 || bc.TriggerNPCs.Any(n => n.Equals(npc.FullName, StringComparison.OrdinalIgnoreCase));
-            
-            // 2. The Semantic Trait Check
             bool tagMatch = CheckSemanticTags(bc, npc);
 
             if (nameMatch && tagMatch && CheckConditions(bc)) ExecuteBroadcast(bc, null, npc.FullName);
@@ -190,7 +230,9 @@ public class HeraldPlugin : TerrariaPlugin
         if (player == null || !player.Active) return;
 
         string deathMessage = reason.GetDeathText(player.Name).ToString();
-        foreach (var bc in _allBroadcasts.Where(b => b.Enabled && b.TriggerTypes.Contains("Death")))
+        
+        // ZERO LINQ OVERHEAD
+        foreach (var bc in _deathBroadcasts)
         {
             if (bc.TriggerWords.Count == 0 || bc.TriggerWords.Any(tw => deathMessage.Contains(tw, StringComparison.OrdinalIgnoreCase)))
             {
@@ -202,38 +244,22 @@ public class HeraldPlugin : TerrariaPlugin
         }
     }
 
-    // --- EVALUATION & EXECUTION ---
-    
-    // NEW: On-the-fly Semantic Evaluator
     private bool CheckSemanticTags(Broadcast bc, NPC npc)
     {
         if (bc.TriggerTags.Count == 0) return true;
 
-        foreach(var tag in bc.TriggerTags.Select(t => t.ToLower()))
+        foreach(var tag in bc.TriggerTags)
         {
-            if (tag == "boss" && !npc.boss) return false;
-            if (tag == "flying" && !npc.noGravity) return false;
-            if (tag == "aquatic" && npc.waterMovementSpeed <= 0) return false;
-            if (tag == "slime" && npc.aiStyle != 1 && npc.aiStyle != 15) return false;
-            if (tag == "townnpc" && !npc.townNPC) return false;
-            if (tag == "enemy" && (npc.friendly || npc.townNPC)) return false;
-            
-            // Proxies for difficulty if admins want to target elite enemies
-            if (tag == "elite" && npc.value < 1000) return false; 
+            string t = tag.ToLower();
+            if (t == "boss" && !npc.boss) return false;
+            if (t == "flying" && !npc.noGravity) return false;
+            if (t == "aquatic" && npc.waterMovementSpeed <= 0) return false;
+            if (t == "slime" && npc.aiStyle != 1 && npc.aiStyle != 15) return false;
+            if (t == "townnpc" && !npc.townNPC) return false;
+            if (t == "enemy" && (npc.friendly || npc.townNPC)) return false;
+            if (t == "elite" && npc.value < 1000) return false; 
         }
         return true; 
-    }
-
-    private void ProcessBroadcasts(string trigger, string type, TSPlayer? target)
-    {
-        foreach (var bc in _allBroadcasts.Where(b => b.Enabled && b.TriggerTypes.Contains(type)))
-        {
-            if ((bc.TriggerWords.Count == 0 || bc.TriggerWords.Contains(trigger, StringComparer.OrdinalIgnoreCase)) 
-                && CheckConditions(bc) && CheckAccess(bc, target) && CheckRegion(bc, target))
-            {
-                ExecuteBroadcast(bc, target);
-            }
-        }
     }
 
     private bool CheckAccess(Broadcast bc, TSPlayer? player)
@@ -255,13 +281,14 @@ public class HeraldPlugin : TerrariaPlugin
         if (bc.AllowedDays.Count > 0 && !bc.AllowedDays.Contains(DateTime.Now.DayOfWeek.ToString(), StringComparer.OrdinalIgnoreCase)) return false;
         if (bc.Conditions.Count == 0) return true;
 
-        foreach (var cond in bc.Conditions.Select(c => c.ToLower()))
+        foreach (var cond in bc.Conditions)
         {
-            if (cond == "raining" && !Main.raining) return false;
-            if (cond == "day" && !Main.dayTime) return false;
-            if (cond == "night" && Main.dayTime) return false;
-            if (cond == "bloodmoon" && !Main.bloodMoon) return false;
-            if (cond == "streaming" && !_config.IsStreaming) return false;
+            string c = cond.ToLower();
+            if (c == "raining" && !Main.raining) return false;
+            if (c == "day" && !Main.dayTime) return false;
+            if (c == "night" && Main.dayTime) return false;
+            if (c == "bloodmoon" && !Main.bloodMoon) return false;
+            if (c == "streaming" && !_config.IsStreaming) return false;
         }
         return true;
     }
@@ -281,7 +308,7 @@ public class HeraldPlugin : TerrariaPlugin
             string msg = bc.Messages[Random.Shared.Next(bc.Messages.Count)]
                 .Replace("{player}", target?.Name ?? "Server")
                 .Replace("{world}", Main.worldName)
-                .Replace("{context}", specialContext ?? "") // Helpful: will output the dead mob's name or death reason
+                .Replace("{context}", specialContext ?? "")
                 .Replace("{streamer}", _config.StreamerName)
                 .Replace("{streamUrl}", _config.StreamUrl)
                 .Replace("{online}", TShock.Players.Count(p => p != null && p.Active).ToString());
@@ -292,8 +319,14 @@ public class HeraldPlugin : TerrariaPlugin
             string targetWebhook = !string.IsNullOrWhiteSpace(bc.DiscordWebhookUrl) ? bc.DiscordWebhookUrl : _config.GlobalDiscordWebhookUrl;
             if (!string.IsNullOrWhiteSpace(targetWebhook))
             {
+                // DEBOUNCER: Prevent Discord Rate-Limit Bans
+                string debounceKey = $"{targetWebhook}_{msg}";
+                if (_webhookDebouncer.TryGetValue(debounceKey, out DateTime lastSent) && (DateTime.UtcNow - lastSent).TotalSeconds < 5) return;
+                
+                _webhookDebouncer[debounceKey] = DateTime.UtcNow;
+
                 var payload = new { embeds = new[] { new { description = msg, color = (bc.TextColor.R << 16) | (bc.TextColor.G << 8) | bc.TextColor.B } } };
-                _ = _httpClient.PostAsync(targetWebhook, new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+                _ = _httpClient.PostAsync(targetWebhook, new StringContent(JsonSerializer.Serialize(payload, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }), Encoding.UTF8, "application/json"));
             }
         }
     }
@@ -316,7 +349,15 @@ public class HeraldPlugin : TerrariaPlugin
         else if (cmd == "live")
         {
             _config.IsStreaming = !_config.IsStreaming;
-            File.WriteAllText(ConfigPath, JsonSerializer.Serialize(_config, HeraldJsonContext.Default.HeraldConfig));
+            
+            // Disable watcher temporarily to prevent collision IOException
+            if (_configWatcher != null) _configWatcher.EnableRaisingEvents = false;
+            
+            var options = new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+            File.WriteAllText(ConfigPath, JsonSerializer.Serialize(_config, options));
+            
+            if (_configWatcher != null) _configWatcher.EnableRaisingEvents = true;
+
             args.Player.SendSuccessMessage($"[Herald] Streamer Mode: {(_config.IsStreaming ? "ON" : "OFF")}");
         }
     }
